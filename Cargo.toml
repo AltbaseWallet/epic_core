@@ -1,0 +1,18 @@
+[package]
+name = "altbase_epic_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+epic_wallet_api = { path = "../vendor/epic_wallet_src/api" }
+epic_wallet_config = { path = "../vendor/epic_wallet_src/config" }
+epic_wallet_impls = { path = "../vendor/epic_wallet_src/impls" }
+epic_wallet_libwallet = { path = "../vendor/epic_wallet_src/libwallet" }
+epic_wallet_util = { path = "../vendor/epic_wallet_src/util" }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

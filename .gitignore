@@ -1,0 +1,13 @@
+target/
+*.rs.bk
+*.pdb
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.exe
+*.zip
+*.tar
+*.tar.gz
+*.7z
