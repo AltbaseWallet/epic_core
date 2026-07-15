@@ -1,10 +1,23 @@
 [package]
 name = "altbase_epic_core"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
+build = "build.rs"
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+default = ["snapshot", "send-prepare", "transport-client"]
+snapshot = []
+send = ["send-prepare", "send-publish"]
+send-prepare = []
+send-publish = []
+listener = []
+transport-client = []
+transport-server = []
+state-server = []
+sender-server = []
 
 [dependencies]
 epic_wallet_api = { path = "../vendor/epic_wallet_src/api" }
@@ -13,6 +26,17 @@ epic_wallet_impls = { path = "../vendor/epic_wallet_src/impls" }
 epic_wallet_libwallet = { path = "../vendor/epic_wallet_src/libwallet" }
 epic_wallet_util = { path = "../vendor/epic_wallet_src/util" }
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[patch."https://github.com/EpicCash/rust-secp256k1-zkp"]
+grin_secp256k1zkp = { path = "../vendor/rust_secp256k1_zkp" }
+
+[profile.release]
+opt-level = "s"
+debug = false
+incremental = false
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

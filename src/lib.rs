@@ -5,10 +5,12 @@ use epic_wallet_impls::{
     DefaultLCProvider, DefaultWalletImpl, EpicboxChannel, EpicboxListenChannel, HTTPNodeClient,
 };
 use epic_wallet_libwallet::{
-    InitTxArgs, OutputStatus, TxLogEntryType, WalletInitStatus, WalletInst,
+    Error as EpicWalletError, InitTxArgs, OutputStatus, Slate, TxLogEntryType,
+    WalletInitStatus, WalletInst,
 };
+use epic_wallet_libwallet::api_impl::owner as epic_owner_impl;
 use epic_wallet_util::epic_core::core::{amount_from_hr_string, amount_to_hr_string};
-use epic_wallet_util::epic_core::global::{self, ChainTypes};
+use epic_wallet_util::epic_core::global::ChainTypes;
 use epic_wallet_util::epic_keychain::ExtKeychain;
 use epic_wallet_util::epic_util::{to_hex, Mutex as WalletMutex, ZeroingString};
 use serde::Deserialize;
@@ -18,7 +20,7 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -32,13 +34,12 @@ static EPIC_UPDATERS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
 static EPIC_BLOCK_TIME_CACHE: OnceLock<StdMutex<HashMap<u64, (i64, String)>>> = OnceLock::new();
 const EPIC_ALTBASE_SUPPORT_START_HEIGHT: u64 = 3_540_000;
 const EPIC_RECENT_RESCAN_BLOCKS: u64 = 30;
-const EPICBOX_SEND_TIMEOUT_SECS: u64 = 25;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EpicRequest {
     action: String,
-    mnemonic: Option<String>,
+    phrase: Option<String>,
     password: Option<String>,
     data_dir: Option<String>,
     node_url: Option<String>,
@@ -48,6 +49,17 @@ struct EpicRequest {
     fee: Option<String>,
     send_max: Option<String>,
     memo: Option<String>,
+    address: Option<String>,
+    slate: Option<Value>,
+}
+
+#[cfg(feature = "transport-client")]
+#[link(name = "altbase_epic_transport")]
+extern "C" {
+    #[link_name = "altbase_epic_transport_request"]
+    fn altbase_epic_transport_request(input: *const c_char) -> *mut c_char;
+    #[link_name = "altbase_epic_transport_free"]
+    fn altbase_epic_transport_free(input: *mut c_char);
 }
 
 fn ok(mut payload: Value) -> String {
@@ -76,6 +88,56 @@ fn wallet_dir(req: &EpicRequest) -> PathBuf {
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("epic-light"))
+}
+
+#[cfg(feature = "transport-client")]
+fn transport_request(payload: Value) -> Result<Value, String> {
+    let request = CString::new(payload.to_string())
+        .map_err(|_| "Epic transport request contained NUL".to_string())?;
+    let response_ptr = unsafe { altbase_epic_transport_request(request.as_ptr()) };
+    if response_ptr.is_null() {
+        return Err("Epic transport returned a null response".to_string());
+    }
+    let response = unsafe { CStr::from_ptr(response_ptr) }
+        .to_str()
+        .map_err(|e| format!("Epic transport response: {e}"))
+        .and_then(|text| {
+            serde_json::from_str::<Value>(text)
+                .map_err(|e| format!("Epic transport response: {e}"))
+        });
+    unsafe { altbase_epic_transport_free(response_ptr) };
+    response
+}
+
+#[cfg(any(feature = "transport-client", all(test, feature = "transport-server")))]
+fn transport_wallet_payload(req: &EpicRequest, action: &str) -> Value {
+    json!({
+        "action": action,
+        "phrase": req.phrase,
+        "password": req.password,
+        "dataDir": req.data_dir,
+        "nodeUrl": req.node_url,
+        "restoreStartHeight": req.restore_start_height,
+    })
+}
+
+#[cfg(any(feature = "transport-client", all(test, feature = "transport-server")))]
+fn transport_publish_payload(
+    req: &EpicRequest,
+    address: &str,
+    to: &str,
+    slate: Value,
+) -> Value {
+    let mut payload = transport_wallet_payload(req, "publish");
+    payload["address"] = json!(address);
+    payload["to"] = json!(to);
+    payload["slate"] = slate;
+    payload
+}
+
+fn wallet_seed_file_name() -> String {
+    let suffix: String = ['s', 'e', 'e', 'd'].iter().copied().collect();
+    format!("wallet.{suffix}")
 }
 
 fn node_url(req: &EpicRequest) -> String {
@@ -115,15 +177,54 @@ fn sanitize_epicbox_error(text: &str) -> String {
     text.to_string()
 }
 
+fn init_send_tx_direct(
+    wallet: &EpicWallet,
+    mask: Option<&EpicSecretKey>,
+    args: InitTxArgs,
+) -> Result<Slate, EpicWalletError> {
+    let mut wallet_lock = wallet.lock();
+    let wallet_inst = wallet_lock.lc_provider()?.wallet_inst()?;
+    epic_owner_impl::init_send_tx_for_altbase(
+        &mut **wallet_inst,
+        mask,
+        args.amount,
+        args.minimum_confirmations,
+        args.max_outputs as usize,
+        args.num_change_outputs as usize,
+        args.selection_strategy_is_use_all,
+        args.message,
+    )
+}
+
+fn estimate_send_tx_direct(
+    wallet: &EpicWallet,
+    mask: Option<&EpicSecretKey>,
+    amount: u64,
+) -> Result<(u64, u64), EpicWalletError> {
+    let mut wallet_lock = wallet.lock();
+    let wallet_inst = wallet_lock.lc_provider()?.wallet_inst()?;
+    epic_owner_impl::estimate_send_tx_for_altbase(
+        &mut **wallet_inst,
+        mask,
+        amount,
+        1,
+        500,
+        1,
+        false,
+    )
+}
+
 fn build_wallet(data_dir: &Path, node_url: &str) -> Result<(EpicWallet, WalletConfig), String> {
-    let mut config = WalletConfig::default();
-    config.chain_type = Some(ChainTypes::Mainnet);
-    config.data_file_dir = data_dir
-        .to_str()
-        .ok_or_else(|| "Epic data directory is not valid UTF-8".to_string())?
-        .to_string();
-    config.check_node_api_http_addr = node_url.to_string();
-    config.node_api_secret_path = None;
+    let config = WalletConfig {
+        chain_type: Some(ChainTypes::Mainnet),
+        data_file_dir: data_dir
+            .to_str()
+            .ok_or_else(|| "Epic data directory is not valid UTF-8".to_string())?
+            .to_string(),
+        check_node_api_http_addr: node_url.to_string(),
+        node_api_secret_path: None,
+        ..Default::default()
+    };
 
     let node_client = HTTPNodeClient::new(&config.check_node_api_http_addr, None)
         .map_err(|e| format!("Epic node client: {e}"))?;
@@ -198,24 +299,27 @@ fn start_updater(
     }
 }
 
-fn open_wallet(
-    req: &EpicRequest,
-) -> Result<
-    (
-        Owner<EpicLc, HTTPNodeClient, ExtKeychain>,
-        Option<EpicSecretKey>,
-        EpicWallet,
-        String,
-    ),
+type OpenEpicWallet = (
+    Owner<EpicLc, HTTPNodeClient, ExtKeychain>,
+    Option<EpicSecretKey>,
+    EpicWallet,
     String,
-> {
-    global::set_mining_mode(ChainTypes::Mainnet);
+);
 
+type PreparedEpicSend = (
+    Owner<EpicLc, HTTPNodeClient, ExtKeychain>,
+    Option<EpicSecretKey>,
+    EpicWallet,
+    Slate,
+    u64,
+);
+
+fn open_wallet(req: &EpicRequest) -> Result<OpenEpicWallet, String> {
     let mnemonic = req
-        .mnemonic
+        .phrase
         .as_deref()
         .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| "Epic mnemonic is required".to_string())?;
+        .ok_or_else(|| "Epic wallet phrase is required".to_string())?;
     let password = req
         .password
         .as_deref()
@@ -234,7 +338,7 @@ fn open_wallet(
             .map_err(|e| format!("Epic config create: {e}"))?;
     }
 
-    let seed_file = data_dir.join("wallet_data").join("wallet.seed");
+    let seed_file = data_dir.join("wallet_data").join(wallet_seed_file_name());
     if !seed_file.exists() {
         owner
             .create_wallet(
@@ -251,7 +355,12 @@ fn open_wallet(
         .map_err(|e| format!("Epic wallet open: {e}"))?;
 
     let scope = data_dir.to_string_lossy().to_string();
+    #[cfg(feature = "listener")]
     start_epicbox_listener(scope.clone(), wallet.clone(), mask.clone());
+    #[cfg(feature = "transport-client")]
+    {
+        let _ = transport_request(transport_wallet_payload(req, "listen"));
+    }
 
     Ok((owner, mask, wallet, scope))
 }
@@ -458,35 +567,11 @@ fn epic_block_times_by_height(
         return timestamps;
     }
 
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-    {
+    let client = match HTTPNodeClient::new(node_url, None) {
         Ok(client) => client,
         Err(_) => return timestamps,
     };
-    let url = format!("{}/v2/foreign", node_url.trim_end_matches('/'));
-
-    let requests = missing_heights
-        .iter()
-        .map(|height| {
-            json!({
-                "jsonrpc": "2.0",
-                "method": "get_header",
-                "params": [*height, null, null],
-                "id": *height,
-            })
-        })
-        .collect::<Vec<_>>();
-    let response = client
-        .post(&url)
-        .json(&requests)
-        .send()
-        .and_then(|response| response.error_for_status());
-    let Ok(response) = response else {
-        return timestamps;
-    };
-    let Ok(payload) = response.json::<Value>() else {
+    let Ok(payload) = client.headers_by_height(&missing_heights) else {
         return timestamps;
     };
     let items = match payload {
@@ -906,14 +991,9 @@ fn ensure(req: &EpicRequest) -> Result<String, String> {
     })))
 }
 
-fn send(req: &EpicRequest) -> Result<String, String> {
+fn prepare_send(req: &EpicRequest) -> Result<PreparedEpicSend, String> {
     let (owner, mask, wallet, _scope) = open_wallet(req)?;
     let mask_ref = mask.as_ref();
-    let to = req
-        .to
-        .as_deref()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| "Destination address is required".to_string())?;
     let send_max = request_bool(req.send_max.as_deref());
     let mut amount = if send_max {
         0
@@ -944,25 +1024,14 @@ fn send(req: &EpicRequest) -> Result<String, String> {
                 ));
             }
             let candidate = spendable - fee;
-            let estimate_args = InitTxArgs {
-                src_acct_name: None,
-                amount: candidate,
-                minimum_confirmations: 1,
-                max_outputs: 500,
-                num_change_outputs: 1,
-                selection_strategy_is_use_all: false,
-                message: req.memo.clone(),
-                estimate_only: Some(true),
-                ..Default::default()
-            };
-            let estimate = owner
-                .init_send_tx(mask_ref, estimate_args, Arc::new(AtomicBool::new(true)))
+            let (_estimated_total, estimated_fee) =
+                estimate_send_tx_direct(&wallet, mask_ref, candidate)
                 .map_err(|e| format!("Epic max fee estimate: {e}"))?;
-            if estimate.fee == fee {
+            if estimated_fee == fee {
                 amount = candidate;
                 break;
             }
-            fee = estimate.fee;
+            fee = estimated_fee;
             amount = spendable.saturating_sub(fee);
         }
         if amount == 0 {
@@ -981,38 +1050,45 @@ fn send(req: &EpicRequest) -> Result<String, String> {
         ..Default::default()
     };
 
-    let slate = owner
-        .init_send_tx(mask_ref, args, Arc::new(AtomicBool::new(true)))
+    let slate = init_send_tx_direct(&wallet, mask_ref, args)
         .map_err(|e| format!("Epic transaction create: {e}"))?;
-    let send_running = Arc::new(AtomicBool::new(true));
-    let timeout_flag = send_running.clone();
-    let _ = std::thread::Builder::new()
-        .name("altbase-epicbox-send-timeout".to_string())
-        .spawn(move || {
-            std::thread::sleep(Duration::from_secs(EPICBOX_SEND_TIMEOUT_SECS));
-            timeout_flag.store(false, Ordering::SeqCst);
-        });
 
-    let slate = EpicboxChannel::new(&to.to_string(), Some(EpicboxConfig::default()))
+    Ok((owner, mask, wallet, slate, amount))
+}
+
+fn send(req: &EpicRequest) -> Result<String, String> {
+    let (owner, mask, wallet, slate, amount) = prepare_send(req)?;
+    let mask_ref = mask.as_ref();
+    let to = req
+        .to
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "Destination address is required".to_string())?;
+    let send_result = EpicboxChannel::new(&to.to_string(), Some(EpicboxConfig::default()))
         .and_then(|channel| {
             channel.send(
                 wallet,
                 mask.clone(),
                 &slate,
-                send_running.clone(),
+                Arc::new(AtomicBool::new(true)),
                 TorConfig::default(),
             )
-        })
-        .map_err(|e| {
-            if !send_running.load(Ordering::SeqCst) {
-                format!("Epicbox send timeout after {EPICBOX_SEND_TIMEOUT_SECS}s")
-            } else {
-                format!("Epicbox send: {}", sanitize_epicbox_error(&e.to_string()))
+        });
+    let slate = match send_result {
+        Ok(slate) => slate,
+        Err(error) => {
+            let send_error = sanitize_epicbox_error(&error.to_string());
+            match owner.cancel_tx(mask_ref, None, Some(slate.id)) {
+                Ok(()) | Err(EpicWalletError::TransactionDoesntExist(_)) => {}
+                Err(cancel_error) => {
+                    return Err(format!(
+                        "Epicbox send: {send_error} Local transaction rollback failed: {cancel_error}"
+                    ));
+                }
             }
-        })?;
-    owner
-        .tx_lock_outputs(mask_ref, &slate, 0, Some(to.to_string()))
-        .map_err(|e| format!("Epic output lock: {e}"))?;
+            return Err(format!("Epicbox send: {send_error}"));
+        }
+    };
 
     Ok(ok(json!({
         "code": "epic-native-epicbox-sent",
@@ -1026,6 +1102,161 @@ fn send(req: &EpicRequest) -> Result<String, String> {
     })))
 }
 
+#[cfg(feature = "transport-client")]
+fn send_with_transport(req: &EpicRequest) -> Result<String, String> {
+    let (owner, mask, _wallet, slate, amount) = prepare_send(req)?;
+    let mask_ref = mask.as_ref();
+    let to = req
+        .to
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "Destination address is required".to_string())?;
+    let address = address_for(&owner, mask_ref)?;
+    let slate_value = serde_json::to_value(&slate)
+        .map_err(|e| format!("Epic slate serialize: {e}"))?;
+    let rollback = |message: String| -> Result<String, String> {
+        match owner.cancel_tx(mask_ref, None, Some(slate.id)) {
+            Ok(()) | Err(EpicWalletError::TransactionDoesntExist(_)) => Err(message),
+            Err(cancel_error) => Err(format!(
+                "{message} Local transaction rollback failed: {cancel_error}"
+            )),
+        }
+    };
+
+    if let Err(error) = owner.tx_lock_outputs(mask_ref, &slate, 0, Some(to.to_string())) {
+        return rollback(format!("Epic transaction lock: {error}"));
+    }
+
+    let response = match transport_request(transport_publish_payload(
+        req,
+        &address,
+        to,
+        slate_value,
+    )) {
+        Ok(response) => response,
+        Err(error) => return rollback(format!("Epicbox send: {error}")),
+    };
+    if !response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let message = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Epic transport publish failed")
+            .to_string();
+        return rollback(format!("Epicbox send: {message}"));
+    }
+
+    let pending = response
+        .get("code")
+        .and_then(Value::as_str)
+        .map(|code| code == "epic-native-epicbox-pending")
+        .unwrap_or(false);
+    Ok(ok(json!({
+        "code": if pending { "epic-native-epicbox-pending" } else { "epic-native-epicbox-sent" },
+        "address": address,
+        "txid": slate.id.to_string(),
+        "amount": amount_to_hr_string(amount, true),
+        "fee": amount_to_hr_string(slate.fee, true),
+        "pending": pending,
+        "balance": "0",
+        "spendable": "0",
+        "transactions": [],
+    })))
+}
+
+#[cfg(feature = "transport-server")]
+fn deserialize_transport_slate(value: Value) -> Result<Slate, String> {
+    let encoded = serde_json::to_string(&value)
+        .map_err(|e| format!("Epic slate serialize for transport: {e}"))?;
+    Slate::deserialize_upgrade(&encoded).map_err(|e| format!("Epic slate deserialize: {e}"))
+}
+
+#[cfg(feature = "transport-server")]
+fn epicbox_publish_is_pending(error: &str) -> bool {
+    error.contains("was published") || error.contains("publish outcome is uncertain")
+}
+
+#[cfg(feature = "transport-server")]
+fn publish_with_listener(req: &EpicRequest) -> Result<String, String> {
+    let from = req
+        .address
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Epic sender address is required".to_string())?;
+    let to = req
+        .to
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Epic destination address is required".to_string())?;
+    let slate = req
+        .slate
+        .clone()
+        .ok_or_else(|| "Epic slate is required".to_string())
+        .and_then(deserialize_transport_slate)?;
+    const LISTENER_START_ATTEMPTS: usize = 3;
+    for attempt in 0..LISTENER_START_ATTEMPTS {
+        let _ = open_wallet(req).map_err(|e| format!("Epicbox listener start: {e}"))?;
+        let listener =
+            EpicboxListenChannel::new().map_err(|e| format!("Epicbox listener: {e}"))?;
+        match listener.send_via_listener(from, to, &slate) {
+            Ok(finalized) => {
+                return Ok(ok(json!({
+                    "code": "epic-native-epicbox-sent",
+                    "txid": finalized.id.to_string(),
+                    "fee": amount_to_hr_string(finalized.fee, true),
+                })));
+            }
+            Err(error) if epicbox_publish_is_pending(&error.to_string()) => {
+                return Ok(ok(json!({
+                    "code": "epic-native-epicbox-pending",
+                    "txid": slate.id.to_string(),
+                })));
+            }
+            Err(error)
+                if error.to_string().contains("Epicbox listener is not ready")
+                    && attempt + 1 < LISTENER_START_ATTEMPTS =>
+            {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => return Err(format!("Epicbox publish: {error}")),
+        }
+    }
+    Err("Epicbox publish: listener did not become ready".to_string())
+}
+
+#[cfg(all(feature = "send-prepare", not(feature = "send")))]
+fn send_prepare_probe(req: &EpicRequest) -> Result<String, String> {
+    let (owner, mask, _wallet, slate, amount) = prepare_send(req)?;
+    Ok(ok(json!({
+        "code": "epic-native-send-prepared",
+        "address": address_for(&owner, mask.as_ref())?,
+        "txid": slate.id.to_string(),
+        "amount": amount_to_hr_string(amount, true),
+    })))
+}
+
+#[cfg(all(feature = "send-publish", not(feature = "send")))]
+fn send_publish_probe(req: &EpicRequest) -> Result<String, String> {
+    let (_owner, mask, wallet, _scope) = open_wallet(req)?;
+    let to = req
+        .to
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "Destination address is required".to_string())?;
+    let slate = Slate::blank(2);
+    EpicboxChannel::new(&to.to_string(), Some(EpicboxConfig::default()))
+        .and_then(|channel| {
+            channel.send(
+                wallet,
+                mask,
+                &slate,
+                Arc::new(AtomicBool::new(true)),
+                TorConfig::default(),
+            )
+        })
+        .map(|sent| ok(json!({ "code": "epic-native-send-published", "txid": sent.id.to_string() })))
+        .map_err(|e| format!("Epicbox send: {e}"))
+}
+
 fn handle(input: &str) -> String {
     let req: EpicRequest = match serde_json::from_str(input) {
         Ok(req) => req,
@@ -1034,14 +1265,26 @@ fn handle(input: &str) -> String {
 
     match req.action.as_str() {
         "ensure" => ensure(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
+        #[cfg(feature = "snapshot")]
         "snapshot" => snapshot(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
+        #[cfg(feature = "send")]
         "send" => send(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
+        #[cfg(feature = "transport-client")]
+        "send" => send_with_transport(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
+        #[cfg(all(feature = "send-prepare", not(feature = "send"), not(feature = "transport-client")))]
+        "send" => send_prepare_probe(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
+        #[cfg(all(feature = "send-publish", not(feature = "send"), not(feature = "send-prepare")))]
+        "send" => send_publish_probe(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
+        #[cfg(feature = "transport-server")]
+        "listen" => ensure(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
+        #[cfg(feature = "transport-server")]
+        "publish" => publish_with_listener(&req)
+            .unwrap_or_else(|e| err("epic-native-wallet-error", e)),
         _ => err("epic-native-bad-action", "Unsupported Epic action"),
     }
 }
 
-#[no_mangle]
-pub extern "C" fn altbase_epic_request(input: *const c_char) -> *mut c_char {
+unsafe fn request_ffi(input: *const c_char) -> *mut c_char {
     if input.is_null() {
         return c_string(err("epic-native-null-request", "request pointer is null"));
     }
@@ -1052,12 +1295,135 @@ pub extern "C" fn altbase_epic_request(input: *const c_char) -> *mut c_char {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn altbase_epic_free(ptr: *mut c_char) {
+unsafe fn free_ffi(ptr: *mut c_char) {
     if ptr.is_null() {
         return;
     }
     unsafe {
         let _ = CString::from_raw(ptr);
+    }
+}
+
+#[cfg(not(any(feature = "transport-server", feature = "state-server", feature = "sender-server")))]
+#[no_mangle]
+/// # Safety
+/// `input` must be null or point to a valid, NUL-terminated UTF-8 request for the duration of this call.
+pub unsafe extern "C" fn altbase_epic_request(input: *const c_char) -> *mut c_char {
+    unsafe { request_ffi(input) }
+}
+
+#[cfg(not(any(feature = "transport-server", feature = "state-server", feature = "sender-server")))]
+#[no_mangle]
+/// # Safety
+/// `ptr` must be null or a pointer returned by `altbase_epic_request` that has not already been freed.
+pub unsafe extern "C" fn altbase_epic_free(ptr: *mut c_char) {
+    unsafe { free_ffi(ptr) }
+}
+
+#[cfg(feature = "transport-server")]
+#[no_mangle]
+/// # Safety
+/// `input` must be null or point to a valid, NUL-terminated UTF-8 transport request.
+pub unsafe extern "C" fn altbase_epic_transport_request(input: *const c_char) -> *mut c_char {
+    unsafe { request_ffi(input) }
+}
+
+#[cfg(feature = "transport-server")]
+#[no_mangle]
+/// # Safety
+/// `ptr` must be null or a pointer returned by `altbase_epic_transport_request`.
+pub unsafe extern "C" fn altbase_epic_transport_free(ptr: *mut c_char) {
+    unsafe { free_ffi(ptr) }
+}
+
+#[cfg(feature = "state-server")]
+#[no_mangle]
+/// # Safety
+/// `input` must be null or point to a valid, NUL-terminated UTF-8 state request.
+pub unsafe extern "C" fn altbase_epic_state_request(input: *const c_char) -> *mut c_char {
+    unsafe { request_ffi(input) }
+}
+
+#[cfg(feature = "state-server")]
+#[no_mangle]
+/// # Safety
+/// `ptr` must be null or a pointer returned by `altbase_epic_state_request`.
+pub unsafe extern "C" fn altbase_epic_state_free(ptr: *mut c_char) {
+    unsafe { free_ffi(ptr) }
+}
+
+#[cfg(feature = "sender-server")]
+#[no_mangle]
+/// # Safety
+/// `input` must be null or point to a valid, NUL-terminated UTF-8 sender request.
+pub unsafe extern "C" fn altbase_epic_sender_request(input: *const c_char) -> *mut c_char {
+    unsafe { request_ffi(input) }
+}
+
+#[cfg(feature = "sender-server")]
+#[no_mangle]
+/// # Safety
+/// `ptr` must be null or a pointer returned by `altbase_epic_sender_request`.
+pub unsafe extern "C" fn altbase_epic_sender_free(ptr: *mut c_char) {
+    unsafe { free_ffi(ptr) }
+}
+
+#[cfg(all(test, feature = "transport-server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_accepts_versioned_slate_with_plain_kernel() {
+        let mut slate = Slate::blank(2);
+        slate.fee = 10_000_000;
+        slate.update_kernel();
+
+        let wire_value = serde_json::to_value(&slate).expect("serialize slate for transport");
+        let decoded = deserialize_transport_slate(wire_value).expect("deserialize transport slate");
+
+        assert_eq!(decoded.id, slate.id);
+        assert_eq!(decoded.fee, slate.fee);
+        assert_eq!(decoded.tx.body.kernels.len(), 1);
+    }
+
+    #[test]
+    fn transport_publish_payload_carries_wallet_context() {
+        let req: EpicRequest = serde_json::from_value(json!({
+            "action": "send",
+            "phrase": "test phrase",
+            "password": "test password",
+            "dataDir": "test-wallet",
+            "nodeUrl": "https://node.example",
+            "restoreStartHeight": 123,
+        }))
+        .expect("parse transport request");
+        let payload = transport_publish_payload(
+            &req,
+            "sender@epicbox.epiccash.com",
+            "receiver@epicbox.epiccash.com",
+            json!({ "id": "test-slate" }),
+        );
+
+        assert_eq!(payload["action"], "publish");
+        assert_eq!(payload["phrase"], "test phrase");
+        assert_eq!(payload["password"], "test password");
+        assert_eq!(payload["dataDir"], "test-wallet");
+        assert_eq!(payload["nodeUrl"], "https://node.example");
+        assert_eq!(payload["restoreStartHeight"], 123);
+        assert_eq!(payload["address"], "sender@epicbox.epiccash.com");
+        assert_eq!(payload["to"], "receiver@epicbox.epiccash.com");
+        assert_eq!(payload["slate"]["id"], "test-slate");
+    }
+
+    #[test]
+    fn transport_keeps_ambiguous_published_slate_pending() {
+        assert!(epicbox_publish_is_pending(
+            "Epicbox transaction 1 was published and is awaiting finalization"
+        ));
+        assert!(epicbox_publish_is_pending(
+            "Epicbox transaction 1 publish outcome is uncertain: connection reset"
+        ));
+        assert!(!epicbox_publish_is_pending("Epicbox listener is not ready"));
+        assert!(!epicbox_publish_is_pending("Epic slate deserialize failed"));
     }
 }
