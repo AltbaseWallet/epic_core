@@ -30,7 +30,6 @@ type EpicWallet =
     Arc<WalletMutex<Box<dyn WalletInst<'static, EpicLc, HTTPNodeClient, ExtKeychain>>>>;
 
 static EPICBOX_LISTENERS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
-static EPIC_UPDATERS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
 static EPIC_BLOCK_TIME_CACHE: OnceLock<StdMutex<HashMap<u64, (i64, String)>>> = OnceLock::new();
 const EPIC_ALTBASE_SUPPORT_START_HEIGHT: u64 = 3_540_000;
 const EPIC_RECENT_RESCAN_BLOCKS: u64 = 30;
@@ -44,6 +43,7 @@ struct EpicRequest {
     data_dir: Option<String>,
     node_url: Option<String>,
     restore_start_height: Option<u64>,
+    force_rescan: Option<bool>,
     to: Option<String>,
     amount: Option<String>,
     fee: Option<String>,
@@ -258,45 +258,22 @@ fn start_epicbox_listener(scope: String, wallet: EpicWallet, mask: Option<EpicSe
         .spawn(move || {
             let mask = Arc::new(WalletMutex::new(mask));
             let mut reconnections = 0;
-            let result = EpicboxListenChannel::new().and_then(|listener| {
-                listener.listen(
-                    wallet,
-                    mask,
-                    EpicboxConfig::default(),
-                    &mut reconnections,
-                    Arc::new(AtomicBool::new(true)),
-                    TorConfig::default(),
-                )
-            });
-            let _ = result;
-            if let Some(listeners) = EPICBOX_LISTENERS.get() {
-                if let Ok(mut guard) = listeners.lock() {
-                    guard.remove(&scope);
-                }
+            loop {
+                let _ = EpicboxListenChannel::new().and_then(|listener| {
+                    listener.listen(
+                        wallet.clone(),
+                        mask.clone(),
+                        EpicboxConfig::default(),
+                        &mut reconnections,
+                        Arc::new(AtomicBool::new(true)),
+                        TorConfig::default(),
+                    )
+                });
+                // Reconnect without waiting for the renderer to request another
+                // snapshot. This keeps receipt live while the window is hidden.
+                std::thread::sleep(Duration::from_secs(2));
             }
         });
-}
-
-fn start_updater(
-    scope: &str,
-    owner: &Owner<EpicLc, HTTPNodeClient, ExtKeychain>,
-    mask: Option<&EpicSecretKey>,
-) {
-    let updaters = EPIC_UPDATERS.get_or_init(|| StdMutex::new(HashSet::new()));
-    {
-        let mut guard = match updaters.lock() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
-        if !guard.insert(scope.to_string()) {
-            return;
-        }
-    }
-    if owner.start_updater(mask, Duration::from_secs(45)).is_err() {
-        if let Ok(mut guard) = updaters.lock() {
-            guard.remove(scope);
-        }
-    }
 }
 
 type OpenEpicWallet = (
@@ -756,11 +733,12 @@ fn ensure_restore_scan(
     scope: &str,
 ) -> Result<(), String> {
     let marker = restore_scan_marker(scope);
+    let force_rescan = req.force_rescan.unwrap_or(false);
     let start_height = req
         .restore_start_height
         .filter(|height| *height > 0)
         .unwrap_or(EPIC_ALTBASE_SUPPORT_START_HEIGHT);
-    if marker.exists() {
+    if marker.exists() && !force_rescan {
         if let Some(height) = marker_start_height(&marker) {
             if height <= start_height {
                 return mark_init_complete(wallet, mask);
@@ -775,7 +753,7 @@ fn ensure_restore_scan(
     }
 
     owner
-        .scan(mask, Some(start_height), false)
+        .scan(mask, Some(start_height), force_rescan)
         .map_err(|e| format!("Epic restore scan: {e}"))?;
     mark_init_complete(wallet, mask)?;
 
@@ -803,6 +781,12 @@ fn ensure_recent_restore_scan(
     let restore_start = marker_start_height(&marker)
         .filter(|height| *height <= start_height)
         .unwrap_or(start_height);
+    // A packaged wallet archive can carry an older progress marker than the
+    // restore floor supplied by the GUI cache.  Resuming from that stale marker
+    // makes every startup replay tens of thousands of irrelevant blocks.  The
+    // requested floor is already persisted with the encrypted wallet state, so
+    // never scan below it during the small live catch-up pass.
+    let scan_floor = restore_start.max(start_height);
     let previous_scanned = marker_scanned_height(&marker);
     if previous_scanned
         .map(|height| height >= tip_height)
@@ -812,10 +796,10 @@ fn ensure_recent_restore_scan(
     }
 
     let scan_from = previous_scanned
-        .filter(|height| *height > restore_start)
+        .filter(|height| *height > scan_floor)
         .map(|height| height.saturating_sub(EPIC_RECENT_RESCAN_BLOCKS))
-        .unwrap_or_else(|| tip_height.saturating_sub(EPIC_RECENT_RESCAN_BLOCKS))
-        .max(restore_start)
+        .unwrap_or(scan_floor)
+        .max(scan_floor)
         .min(tip_height);
 
     owner
@@ -832,23 +816,29 @@ fn snapshot(req: &EpicRequest) -> Result<String, String> {
     let address = address_for(&owner, mask_ref)?;
     ensure_restore_scan(req, &owner, mask_ref, &wallet, &scope)?;
 
-    let (mut updated_from_node, mut info) = owner
-        .retrieve_summary_info(mask_ref, true, 1)
-        .map_err(|e| format!("Epic balance refresh: {e}"))?;
-    if ensure_recent_restore_scan(
+    // The reference refresh scans again from the wallet DB's last-scanned
+    // height. Imported encrypted archives can legitimately have a newer GUI
+    // restore floor than that internal marker, so catch the DB up first.
+    let tip_height = owner
+        .node_height(mask_ref)
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+    let caught_up = ensure_recent_restore_scan(
         req,
         &owner,
         mask_ref,
         &wallet,
         &scope,
-        info.last_confirmed_height,
-    )? {
-        let refreshed = owner
-            .retrieve_summary_info(mask_ref, true, 1)
-            .map_err(|e| format!("Epic balance refresh: {e}"))?;
-        updated_from_node = updated_from_node || refreshed.0;
-        info = refreshed.1;
-    }
+        tip_height,
+    )?;
+
+    // A block scan discovers spent outputs, but MAX sends have no change
+    // output that can promote their TxSentCreated row.  The reference wallet
+    // update also performs the kernel lookup required to confirm those sends.
+    // Skipping it leaves an already-mined GUI transaction pending forever.
+    let (updated_from_node, info) = owner
+        .retrieve_summary_info(mask_ref, true, 1)
+        .map_err(|e| format!("Epic balance refresh: {e}"))?;
     let txs = owner
         .retrieve_txs(
             mask_ref,
@@ -860,7 +850,6 @@ fn snapshot(req: &EpicRequest) -> Result<String, String> {
             Some("desc".to_string()),
         )
         .map_err(|e| format!("Epic transaction refresh: {e}"))?;
-    start_updater(&scope, &owner, mask_ref);
     let (spent_by_tx, spent_commits) = spent_outputs_by_tx(&owner, mask_ref);
     let (output_commits_by_tx, mut block_time_heights) =
         output_commits_and_heights_by_tx(&owner, mask_ref);
@@ -968,8 +957,8 @@ fn snapshot(req: &EpicRequest) -> Result<String, String> {
 
     Ok(ok(json!({
         "code": "epic-native-wallet",
-        "updatedFromNode": updated_from_node,
-        "updated_from_node": updated_from_node,
+        "updatedFromNode": updated_from_node || caught_up,
+        "updated_from_node": updated_from_node || caught_up,
         "address": address,
         "balance": amount_to_hr_string(balance_total, true),
         "spendable": amount_to_hr_string(balance_spendable, true),
@@ -987,6 +976,70 @@ fn ensure(req: &EpicRequest) -> Result<String, String> {
         "address": address,
         "balance": "0",
         "spendable": "0",
+        "transactions": [],
+    })))
+}
+
+fn estimate_max_send_values(
+    wallet: &EpicWallet,
+    mask: Option<&EpicSecretKey>,
+    spendable: u64,
+    initial_fee: u64,
+) -> Result<(u64, u64), String> {
+    let mut fee = initial_fee;
+    for _ in 0..8 {
+        if spendable <= fee {
+            return Err(format!(
+                "Epic transaction create: Not enough funds. Required: {}, Available: {}",
+                amount_to_hr_string(fee, true),
+                amount_to_hr_string(spendable, true)
+            ));
+        }
+        let candidate = spendable - fee;
+        match estimate_send_tx_direct(wallet, mask, candidate) {
+            Ok((_estimated_total, estimated_fee)) if estimated_fee == fee => {
+                return Ok((candidate, estimated_fee));
+            }
+            Ok((_estimated_total, estimated_fee)) => {
+                fee = estimated_fee;
+            }
+            Err(EpicWalletError::NotEnoughFunds { available, needed, .. }) if needed > available => {
+                // The candidate used the previous fee. Fold the wallet's exact
+                // atomic deficit into the next candidate when the selected
+                // input/output shape makes MAX one fee step more expensive.
+                let deficit = needed - available;
+                fee = fee
+                    .checked_add(deficit)
+                    .ok_or_else(|| "Epic max fee overflow".to_string())?;
+            }
+            Err(error) => return Err(format!("Epic max fee estimate: {error}")),
+        }
+    }
+    Err("Epic max fee estimate did not converge".to_string())
+}
+
+fn estimate_max_send(req: &EpicRequest) -> Result<String, String> {
+    let (owner, mask, wallet, _scope) = open_wallet(req)?;
+    let mask_ref = mask.as_ref();
+    let (_updated_from_node, info) = owner
+        .retrieve_summary_info(mask_ref, false, 1)
+        .map_err(|e| format!("Epic balance refresh: {e}"))?;
+    let spendable = output_totals(&owner, mask_ref, info.last_confirmed_height)
+        .map(|(_total, spendable)| spendable)
+        .unwrap_or(info.amount_currently_spendable);
+    let (amount, fee) = estimate_max_send_values(
+        &wallet,
+        mask_ref,
+        spendable,
+        requested_or_default_fee(req)?,
+    )?;
+    Ok(ok(json!({
+        "code": "epic-native-max-estimate",
+        "address": address_for(&owner, mask_ref)?,
+        "amount": amount_to_hr_string(amount, true),
+        "fee": amount_to_hr_string(fee, true),
+        "balance": amount_to_hr_string(spendable, true),
+        "spendable": amount_to_hr_string(spendable, true),
         "transactions": [],
     })))
 }
@@ -1009,31 +1062,17 @@ fn prepare_send(req: &EpicRequest) -> Result<PreparedEpicSend, String> {
 
     if send_max {
         let (_updated_from_node, info) = owner
-            .retrieve_summary_info(mask_ref, true, 1)
+            .retrieve_summary_info(mask_ref, false, 1)
             .map_err(|e| format!("Epic balance refresh: {e}"))?;
         let spendable = output_totals(&owner, mask_ref, info.last_confirmed_height)
             .map(|(_total, spendable)| spendable)
             .unwrap_or(info.amount_currently_spendable);
-        let mut fee = requested_or_default_fee(req)?;
-        for _ in 0..6 {
-            if spendable <= fee {
-                return Err(format!(
-                    "Epic transaction create: Not enough funds. Required: {}, Available: {}",
-                    amount_to_hr_string(fee, true),
-                    amount_to_hr_string(spendable, true)
-                ));
-            }
-            let candidate = spendable - fee;
-            let (_estimated_total, estimated_fee) =
-                estimate_send_tx_direct(&wallet, mask_ref, candidate)
-                .map_err(|e| format!("Epic max fee estimate: {e}"))?;
-            if estimated_fee == fee {
-                amount = candidate;
-                break;
-            }
-            fee = estimated_fee;
-            amount = spendable.saturating_sub(fee);
-        }
+        (amount, _) = estimate_max_send_values(
+            &wallet,
+            mask_ref,
+            spendable,
+            requested_or_default_fee(req)?,
+        )?;
         if amount == 0 {
             return Err("Epic transaction create: Not enough funds after fee".to_string());
         }
@@ -1267,6 +1306,8 @@ fn handle(input: &str) -> String {
         "ensure" => ensure(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
         #[cfg(feature = "snapshot")]
         "snapshot" => snapshot(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
+        #[cfg(feature = "send-prepare")]
+        "estimatemax" => estimate_max_send(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
         #[cfg(feature = "send")]
         "send" => send(&req).unwrap_or_else(|e| err("epic-native-wallet-error", e)),
         #[cfg(feature = "transport-client")]
